@@ -1,6 +1,8 @@
 package synthesizer
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -158,6 +160,11 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
+	// Assign a deterministic per-account device fingerprint for Claude OAuth accounts.
+	// This makes each account look like a different real device (macOS/Windows, different Node versions).
+	if provider == "claude" {
+		applyClaudeDeviceFingerprint(a)
+	}
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
 		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
@@ -341,4 +348,60 @@ func extractExcludedModelsFromMetadata(metadata map[string]any) []string {
 		}
 	}
 	return result
+}
+
+// claudeDeviceFingerprint holds a simulated device profile for Claude OAuth requests.
+type claudeDeviceFingerprint struct {
+	userAgent      string
+	stainlessOS    string
+	stainlessArch  string
+	nodeVersion    string
+	pkgVersion     string
+}
+
+// claudeDevicePool is the pool of realistic device profiles to randomize from.
+// Profiles are based on real Claude Code CLI installations on macOS and Windows.
+var claudeDevicePool = []claudeDeviceFingerprint{
+	{"claude-cli/2.1.81 (external, cli)", "macOS", "arm64", "v22.14.0", "0.74.0"},
+	{"claude-cli/2.1.81 (external, cli)", "macOS", "x64", "v22.14.0", "0.74.0"},
+	{"claude-cli/2.1.81 (external, cli)", "macOS", "arm64", "v22.13.0", "0.74.0"},
+	{"claude-cli/2.1.78 (external, cli)", "macOS", "arm64", "v22.12.0", "0.74.0"},
+	{"claude-cli/2.1.78 (external, cli)", "macOS", "x64", "v22.12.0", "0.74.0"},
+	{"claude-cli/2.1.75 (external, cli)", "macOS", "arm64", "v22.11.0", "0.73.0"},
+	{"claude-cli/2.1.81 (external, cli)", "Windows_NT", "x64", "v22.14.0", "0.74.0"},
+	{"claude-cli/2.1.78 (external, cli)", "Windows_NT", "x64", "v22.12.0", "0.74.0"},
+	{"claude-cli/2.1.75 (external, cli)", "Windows_NT", "x64", "v22.11.0", "0.73.0"},
+	{"claude-cli/2.1.81 (external, cli)", "macOS", "arm64", "v20.18.3", "0.74.0"},
+	{"claude-cli/2.1.78 (external, cli)", "macOS", "arm64", "v20.18.2", "0.74.0"},
+	{"claude-cli/2.1.75 (external, cli)", "Windows_NT", "x64", "v20.18.1", "0.73.0"},
+}
+
+// pickClaudeDeviceFingerprint deterministically picks a fingerprint for a given account ID.
+// Using a hash of the account ID ensures the same account always gets the same fingerprint
+// across restarts, while different accounts get different fingerprints.
+func pickClaudeDeviceFingerprint(accountID string) claudeDeviceFingerprint {
+	h := sha256.Sum256([]byte(accountID))
+	idx := binary.BigEndian.Uint64(h[:8]) % uint64(len(claudeDevicePool))
+	return claudeDevicePool[idx]
+}
+
+// applyClaudeDeviceFingerprint sets per-account device fingerprint headers on the auth,
+// unless the account has already configured custom User-Agent/stainless headers.
+func applyClaudeDeviceFingerprint(a *coreauth.Auth) {
+	if a == nil || a.Attributes == nil {
+		return
+	}
+	// Don't override if user explicitly set custom headers
+	if _, hasUA := a.Attributes["header:User-Agent"]; hasUA {
+		return
+	}
+	if _, hasOS := a.Attributes["header:X-Stainless-Os"]; hasOS {
+		return
+	}
+	fp := pickClaudeDeviceFingerprint(a.ID)
+	a.Attributes["header:User-Agent"] = fp.userAgent
+	a.Attributes["header:X-Stainless-Os"] = fp.stainlessOS
+	a.Attributes["header:X-Stainless-Arch"] = fp.stainlessArch
+	a.Attributes["header:X-Stainless-Runtime-Version"] = fp.nodeVersion
+	a.Attributes["header:X-Stainless-Package-Version"] = fp.pkgVersion
 }
