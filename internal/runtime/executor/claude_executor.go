@@ -95,6 +95,14 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+
+	// Apply per-account rate limiting (RPM + concurrency + request jitter).
+	releaseSlot, errSlot := AcquireClaudeSlot(ctx, auth)
+	if errSlot != nil {
+		return resp, errSlot
+	}
+	defer releaseSlot()
+
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := claudeCreds(auth)
@@ -263,6 +271,14 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+
+	// Apply per-account rate limiting (RPM + concurrency + request jitter).
+	releaseSlot, errSlot := AcquireClaudeSlot(ctx, auth)
+	if errSlot != nil {
+		return nil, errSlot
+	}
+	defer releaseSlot()
+
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := claudeCreds(auth)

@@ -164,6 +164,8 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	// This makes each account look like a different real device (macOS/Windows, different Node versions).
 	if provider == "claude" {
 		applyClaudeDeviceFingerprint(a)
+		// Propagate rate-limit config from JSON fields to Attributes for the executor.
+		applyClaudeRateLimitAttrs(a, metadata)
 	}
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
@@ -404,4 +406,38 @@ func applyClaudeDeviceFingerprint(a *coreauth.Auth) {
 	a.Attributes["header:X-Stainless-Arch"] = fp.stainlessArch
 	a.Attributes["header:X-Stainless-Runtime-Version"] = fp.nodeVersion
 	a.Attributes["header:X-Stainless-Package-Version"] = fp.pkgVersion
+}
+
+// applyClaudeRateLimitAttrs copies rate-limit fields from auth JSON metadata
+// to auth Attributes so the executor can read them without importing synthesizer.
+// Supported JSON fields: "rpm", "max_concurrency", "min_interval_ms"
+func applyClaudeRateLimitAttrs(a *coreauth.Auth, metadata map[string]any) {
+	if a == nil || metadata == nil {
+		return
+	}
+	if a.Attributes == nil {
+		a.Attributes = make(map[string]string)
+	}
+	for _, key := range []string{"rpm", "max_concurrency", "min_interval_ms"} {
+		val, ok := metadata[key]
+		if !ok {
+			continue
+		}
+		var s string
+		switch v := val.(type) {
+		case float64:
+			if v > 0 {
+				s = strconv.Itoa(int(v))
+			}
+		case int:
+			if v > 0 {
+				s = strconv.Itoa(v)
+			}
+		case string:
+			s = strings.TrimSpace(v)
+		}
+		if s != "" {
+			a.Attributes[key] = s
+		}
+	}
 }

@@ -483,6 +483,16 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		if len(fp) > 0 {
 			entry["fingerprint"] = fp
 		}
+		// Expose rate-limit config for Claude accounts.
+		if v := strings.TrimSpace(auth.Attributes["rpm"]); v != "" {
+			entry["rpm"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["max_concurrency"]); v != "" {
+			entry["max_concurrency"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["min_interval_ms"]); v != "" {
+			entry["min_interval_ms"] = v
+		}
 	}
 	return entry
 }
@@ -916,12 +926,15 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name        string            `json:"name"`
-		Prefix      *string           `json:"prefix"`
-		ProxyURL    *string           `json:"proxy_url"`
-		Priority    *int              `json:"priority"`
-		Note        *string           `json:"note"`
-		Fingerprint map[string]string `json:"fingerprint,omitempty"` // device fingerprint headers
+		Name           string            `json:"name"`
+		Prefix         *string           `json:"prefix"`
+		ProxyURL       *string           `json:"proxy_url"`
+		Priority       *int              `json:"priority"`
+		Note           *string           `json:"note"`
+		Fingerprint    map[string]string `json:"fingerprint,omitempty"`    // device fingerprint headers
+		RPM            *int              `json:"rpm,omitempty"`            // max requests per minute (0 = unlimited)
+		MaxConcurrency *int              `json:"max_concurrency,omitempty"` // max concurrent requests (0 = unlimited)
+		MinIntervalMs  *int              `json:"min_interval_ms,omitempty"` // min ms between requests (0 = disabled)
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1026,6 +1039,33 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			}
 		}
 		changed = true
+	}
+
+	// Rate-limit attributes (Claude accounts only).
+	if strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "claude") {
+		if targetAuth.Attributes == nil {
+			targetAuth.Attributes = make(map[string]string)
+		}
+		setOrDel := func(key string, val *int) bool {
+			if val == nil {
+				return false
+			}
+			if *val <= 0 {
+				delete(targetAuth.Attributes, key)
+			} else {
+				targetAuth.Attributes[key] = strconv.Itoa(*val)
+			}
+			return true
+		}
+		if setOrDel("rpm", req.RPM) {
+			changed = true
+		}
+		if setOrDel("max_concurrency", req.MaxConcurrency) {
+			changed = true
+		}
+		if setOrDel("min_interval_ms", req.MinIntervalMs) {
+			changed = true
+		}
 	}
 
 	if !changed {
