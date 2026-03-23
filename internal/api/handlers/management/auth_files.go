@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -461,6 +462,28 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	// Expose current device fingerprint for Claude OAuth accounts.
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") && auth.Attributes != nil {
+		fp := gin.H{}
+		if v := strings.TrimSpace(auth.Attributes["header:User-Agent"]); v != "" {
+			fp["user_agent"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["header:X-Stainless-Os"]); v != "" {
+			fp["os"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["header:X-Stainless-Arch"]); v != "" {
+			fp["arch"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["header:X-Stainless-Runtime-Version"]); v != "" {
+			fp["node_version"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["header:X-Stainless-Package-Version"]); v != "" {
+			fp["pkg_version"] = v
+		}
+		if len(fp) > 0 {
+			entry["fingerprint"] = fp
+		}
+	}
 	return entry
 }
 
@@ -885,7 +908,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note, fingerprint) of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -893,11 +916,12 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string  `json:"name"`
-		Prefix   *string `json:"prefix"`
-		ProxyURL *string `json:"proxy_url"`
-		Priority *int    `json:"priority"`
-		Note     *string `json:"note"`
+		Name        string            `json:"name"`
+		Prefix      *string           `json:"prefix"`
+		ProxyURL    *string           `json:"proxy_url"`
+		Priority    *int              `json:"priority"`
+		Note        *string           `json:"note"`
+		Fingerprint map[string]string `json:"fingerprint,omitempty"` // device fingerprint headers
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -938,6 +962,40 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 	if req.ProxyURL != nil {
 		targetAuth.ProxyURL = *req.ProxyURL
+		changed = true
+	}
+	// Apply device fingerprint headers (user-agent, x-stainless-os, x-stainless-arch, etc.)
+	if req.Fingerprint != nil {
+		if targetAuth.Attributes == nil {
+			targetAuth.Attributes = make(map[string]string)
+		}
+		// Clear previous fingerprint headers
+		for k := range targetAuth.Attributes {
+			if strings.HasPrefix(k, "header:User-Agent") ||
+				strings.HasPrefix(k, "header:X-Stainless-Os") ||
+				strings.HasPrefix(k, "header:X-Stainless-Arch") ||
+				strings.HasPrefix(k, "header:X-Stainless-Runtime-Version") ||
+				strings.HasPrefix(k, "header:X-Stainless-Package-Version") {
+				delete(targetAuth.Attributes, k)
+			}
+		}
+		fpMap := map[string]string{
+			"user_agent":      "header:User-Agent",
+			"os":              "header:X-Stainless-Os",
+			"arch":            "header:X-Stainless-Arch",
+			"node_version":    "header:X-Stainless-Runtime-Version",
+			"pkg_version":     "header:X-Stainless-Package-Version",
+		}
+		for fpKey, attrKey := range fpMap {
+			if val, ok := req.Fingerprint[fpKey]; ok {
+				val = strings.TrimSpace(val)
+				if val == "" {
+					delete(targetAuth.Attributes, attrKey)
+				} else {
+					targetAuth.Attributes[attrKey] = val
+				}
+			}
+		}
 		changed = true
 	}
 	if req.Priority != nil || req.Note != nil {
@@ -2535,4 +2593,98 @@ func PopulateAuthContext(ctx context.Context, c *gin.Context) context.Context {
 		Headers: c.Request.Header,
 	}
 	return coreauth.WithRequestInfo(ctx, info)
+}
+
+// RandomizeClaudeFingerprint assigns a new random device fingerprint to a Claude OAuth account.
+// POST /management/auth-files/randomize-fingerprint  body: {"name": "claude-xxx.json"}
+func (h *Handler) RandomizeClaudeFingerprint(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	// Find auth
+	var targetAuth *coreauth.Auth
+	if auth, ok := h.authManager.GetByID(name); ok {
+		targetAuth = auth
+	} else {
+		for _, auth := range h.authManager.List() {
+			if auth.FileName == name {
+				targetAuth = auth
+				break
+			}
+		}
+	}
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "claude") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "fingerprint randomization only applies to Claude accounts"})
+		return
+	}
+
+	// Pick a random fingerprint (use current time to get a different one each call)
+	pool := []struct {
+		userAgent, os, arch, node, pkg string
+	}{
+		{"claude-cli/2.1.81 (external, cli)", "macOS", "arm64", "v22.14.0", "0.74.0"},
+		{"claude-cli/2.1.81 (external, cli)", "macOS", "x64", "v22.14.0", "0.74.0"},
+		{"claude-cli/2.1.81 (external, cli)", "macOS", "arm64", "v22.13.0", "0.74.0"},
+		{"claude-cli/2.1.78 (external, cli)", "macOS", "arm64", "v22.12.0", "0.74.0"},
+		{"claude-cli/2.1.78 (external, cli)", "macOS", "x64", "v22.12.0", "0.74.0"},
+		{"claude-cli/2.1.75 (external, cli)", "macOS", "arm64", "v22.11.0", "0.73.0"},
+		{"claude-cli/2.1.81 (external, cli)", "Windows_NT", "x64", "v22.14.0", "0.74.0"},
+		{"claude-cli/2.1.78 (external, cli)", "Windows_NT", "x64", "v22.12.0", "0.74.0"},
+		{"claude-cli/2.1.75 (external, cli)", "Windows_NT", "x64", "v22.11.0", "0.73.0"},
+		{"claude-cli/2.1.81 (external, cli)", "macOS", "arm64", "v20.18.3", "0.74.0"},
+		{"claude-cli/2.1.78 (external, cli)", "macOS", "arm64", "v20.18.2", "0.74.0"},
+		{"claude-cli/2.1.75 (external, cli)", "Windows_NT", "x64", "v20.18.1", "0.73.0"},
+	}
+	h256 := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", name, time.Now().UnixNano())))
+	idx := int(binary.BigEndian.Uint64(h256[:8])) % len(pool)
+	if idx < 0 {
+		idx = -idx
+	}
+	fp := pool[idx]
+
+	if targetAuth.Attributes == nil {
+		targetAuth.Attributes = make(map[string]string)
+	}
+	targetAuth.Attributes["header:User-Agent"] = fp.userAgent
+	targetAuth.Attributes["header:X-Stainless-Os"] = fp.os
+	targetAuth.Attributes["header:X-Stainless-Arch"] = fp.arch
+	targetAuth.Attributes["header:X-Stainless-Runtime-Version"] = fp.node
+	targetAuth.Attributes["header:X-Stainless-Package-Version"] = fp.pkg
+	targetAuth.UpdatedAt = time.Now()
+
+	ctx := c.Request.Context()
+	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"fingerprint": gin.H{
+			"user_agent":   fp.userAgent,
+			"os":           fp.os,
+			"arch":         fp.arch,
+			"node_version": fp.node,
+			"pkg_version":  fp.pkg,
+		},
+	})
 }
